@@ -7,14 +7,18 @@ import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
-import { MessageSquare, Send, Users, BookOpen } from "lucide-react"
+import { MessageSquare, Send, Users, BookOpen, Loader2, CheckCircle, AlertCircle } from "lucide-react"
 import { ConfirmationModal } from "@/components/confirmation-modal"
+import { CourseService, APIError } from "@/lib/services"
+import { useToast } from "@/hooks/use-toast"
 
 interface FormData {
   courseId: string
   phoneNumber: string
   userIds: string[]
 }
+
+type SendStatus = 'idle' | 'loading' | 'success' | 'error'
 
 export default function WhatsAppTemplateSender() {
   const [formData, setFormData] = useState<FormData>({
@@ -24,6 +28,9 @@ export default function WhatsAppTemplateSender() {
   })
   const [userIdInput, setUserIdInput] = useState("")
   const [isModalOpen, setIsModalOpen] = useState(false)
+  const [sendStatus, setSendStatus] = useState<SendStatus>('idle')
+  const [errorMessage, setErrorMessage] = useState<string>('')
+  const { toast } = useToast()
 
   const handleAddUserId = () => {
     if (userIdInput.trim() && !formData.userIds.includes(userIdInput.trim())) {
@@ -48,16 +55,152 @@ export default function WhatsAppTemplateSender() {
   }
 
   const handleConfirm = async () => {
-    // Aquí iría la lógica para enviar el template de WhatsApp
-    console.log("Enviando mensaje de inicio de curso:", formData)
+    console.log('=== INICIO DE ENVÍO DE CURSO ===')
+    console.log('📋 Datos del formulario:', {
+      courseId: formData.courseId,
+      phoneNumber: formData.phoneNumber,
+      userIds: formData.userIds,
+    })
+    
+    setSendStatus('loading')
+    setErrorMessage('')
+    
+    try {
+      // Validar formato de número de WhatsApp
+      console.log('🔍 Validando número de WhatsApp...')
+      const normalizedPhone = CourseService.normalizeWhatsAppNumber(formData.phoneNumber)
+      console.log('📞 Número normalizado:', normalizedPhone)
+      
+      if (!CourseService.validateWhatsAppNumber(normalizedPhone)) {
+        console.error('❌ Validación de número fallida')
+        throw new Error('Formato de número de WhatsApp inválido. Use formato internacional (ej: +5493517691441)')
+      }
+      console.log('✅ Número de WhatsApp válido')
 
-    // Simular envío
-    await new Promise((resolve) => setTimeout(resolve, 1000))
+      // Validar ObjectId del curso
+      console.log('🔍 Validando ObjectId del curso...')
+      if (!CourseService.validateObjectId(formData.courseId)) {
+        console.error('❌ Validación de ObjectId fallida')
+        throw new Error('El ID del curso debe ser un ObjectId válido de MongoDB (24 caracteres hexadecimales)')
+      }
+      console.log('✅ ObjectId del curso válido')
 
-    setIsModalOpen(false)
-    // Resetear formulario
-    setFormData({ courseId: "", phoneNumber: "", userIds: [] })
-    setUserIdInput("")
+      // Enviar para cada usuario
+      console.log(`📤 Enviando a ${formData.userIds.length} usuario(s)...`)
+      const results = await Promise.allSettled(
+        formData.userIds.map(async (userId, index) => {
+          console.log(`\n--- Usuario ${index + 1}/${formData.userIds.length} ---`)
+          console.log('👤 User ID:', userId)
+          
+          // Validar que el user_id no esté vacío
+          if (!userId || userId.trim() === '') {
+            console.error(`❌ user_id vacío para usuario ${index + 1}`)
+            throw new Error(`El user_id no puede estar vacío`)
+          }
+          console.log('✅ user_id válido:', userId)
+
+          const payload = {
+            course_id: formData.courseId,
+            waChat_id: normalizedPhone,
+            user_id: userId.trim(),
+          }
+          
+          console.log('📦 Payload a enviar:', payload)
+          
+          try {
+            const response = await CourseService.startCourse(payload)
+            console.log(`✅ Respuesta exitosa para usuario ${index + 1}:`, response)
+            return response
+          } catch (error) {
+            console.error(`❌ Error al enviar para usuario ${index + 1}:`, error)
+            if (error instanceof APIError) {
+              console.error('  - Status:', error.status)
+              console.error('  - Message:', error.message)
+              console.error('  - Data:', error.data)
+            }
+            throw error
+          }
+        })
+      )
+
+      console.log('\n=== RESULTADOS DE ENVÍOS ===')
+      console.log('📊 Total de envíos:', results.length)
+      
+      // Analizar resultados
+      const successful = results.filter((r) => r.status === 'fulfilled')
+      const failed = results.filter((r) => r.status === 'rejected')
+      
+      console.log('✅ Exitosos:', successful.length)
+      console.log('❌ Fallidos:', failed.length)
+      
+      // Mostrar detalles de errores
+      if (failed.length > 0) {
+        console.error('\n🔴 ERRORES DETALLADOS:')
+        failed.forEach((result, index) => {
+          if (result.status === 'rejected') {
+            console.error(`Error ${index + 1}:`, result.reason)
+            if (result.reason instanceof APIError) {
+              console.error(`  - HTTP Status: ${result.reason.status}`)
+              console.error(`  - Message: ${result.reason.message}`)
+              console.error(`  - Response Data:`, result.reason.data)
+            }
+          }
+        })
+      }
+
+      if (successful.length > 0) {
+        console.log('✅ Algunos envíos fueron exitosos')
+        setSendStatus('success')
+        toast({
+          title: "✅ Mensajes enviados",
+          description: `${successful.length} mensaje(s) enviado(s) correctamente${failed.length > 0 ? `, ${failed.length} fallido(s)` : ''}`,
+        })
+
+        // Resetear formulario después de éxito
+        setTimeout(() => {
+          setFormData({ courseId: "", phoneNumber: "", userIds: [] })
+          setUserIdInput("")
+          setSendStatus('idle')
+          setIsModalOpen(false)
+        }, 2000)
+      } else {
+        console.error('❌ TODOS LOS ENVÍOS FALLARON')
+        // Construir mensaje de error detallado
+        const errorDetails = failed.map((result, index) => {
+          if (result.status === 'rejected') {
+            const error = result.reason
+            if (error instanceof APIError) {
+              return `Usuario ${index + 1}: ${error.message} (HTTP ${error.status || 'N/A'})`
+            }
+            return `Usuario ${index + 1}: ${error instanceof Error ? error.message : 'Error desconocido'}`
+          }
+          return ''
+        }).filter(Boolean).join('\n')
+        
+        throw new Error(`Todos los envíos fallaron:\n${errorDetails}`)
+      }
+
+    } catch (error) {
+      console.error('\n🔴 ERROR GENERAL:', error)
+      console.error('Error completo:', error)
+      setSendStatus('error')
+      
+      const errorMsg = error instanceof APIError 
+        ? `${error.message} (HTTP ${error.status || 'N/A'})${error.data ? '\nDetalles: ' + JSON.stringify(error.data, null, 2) : ''}` 
+        : error instanceof Error 
+        ? error.message 
+        : 'Error desconocido al enviar el mensaje'
+      
+      setErrorMessage(errorMsg)
+      
+      toast({
+        title: "❌ Error al enviar mensaje",
+        description: errorMsg,
+        variant: "destructive",
+      })
+    }
+    
+    console.log('=== FIN DE ENVÍO DE CURSO ===\n')
   }
 
   return (
@@ -177,11 +320,38 @@ export default function WhatsAppTemplateSender() {
                   type="submit"
                   size="lg"
                   className="w-full h-12 text-base font-semibold"
-                  disabled={formData.userIds.length === 0}
+                  disabled={formData.userIds.length === 0 || sendStatus === 'loading'}
                 >
-                  <Send className="mr-2 h-5 w-5" />
-                  Enviar mensaje de inicio de curso
+                  {sendStatus === 'loading' ? (
+                    <>
+                      <Loader2 className="mr-2 h-5 w-5 animate-spin" />
+                      Enviando...
+                    </>
+                  ) : sendStatus === 'success' ? (
+                    <>
+                      <CheckCircle className="mr-2 h-5 w-5" />
+                      Enviado exitosamente
+                    </>
+                  ) : (
+                    <>
+                      <Send className="mr-2 h-5 w-5" />
+                      Enviar mensaje de inicio de curso
+                    </>
+                  )}
                 </Button>
+
+                {/* Error Message */}
+                {sendStatus === 'error' && errorMessage && (
+                  <div className="rounded-lg border border-destructive/50 bg-destructive/10 p-4">
+                    <div className="flex gap-3">
+                      <AlertCircle className="h-5 w-5 text-destructive shrink-0 mt-0.5" />
+                      <div className="space-y-1">
+                        <p className="text-sm font-medium text-destructive">Error al enviar</p>
+                        <p className="text-sm text-destructive/90">{errorMessage}</p>
+                      </div>
+                    </div>
+                  </div>
+                )}
               </form>
             </CardContent>
           </Card>
